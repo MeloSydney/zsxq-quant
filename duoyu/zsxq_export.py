@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """知识星球 API 导出脚本 - 使用 zsxq API 直接获取完整帖子，无需浏览器展开"""
 
-import base64
 import errno
-import html
 import json
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -217,47 +216,73 @@ def extract_images(topic: dict) -> list[dict[str, str]]:
     return images
 
 
-def recognize_images(posts: list[dict]) -> None:
-    """Embed actual image bytes and Vision OCR; never invent text when recognition fails."""
-    image_refs = [(post, image) for post in posts for image in post["images"]]
+def prepare_images(posts: list[dict], output_dir: Path, prefix: str) -> Path | None:
+    """下载附图到旁路临时目录并运行 Vision OCR；识别失败绝不臆造文字。
+
+    文件统一命名 {topic_id}-{序号}.jpg（非 JPEG 源经 sips 转换，保证 md 占位符
+    与渲染 base64 的 MIME 一致）；成功返回目录路径，无附图返回 None。
+    """
+    image_refs = []
+    for post in posts:
+        for index, image in enumerate(post["images"], 1):
+            image_refs.append((post, image, index))
     if not image_refs:
-        return
-    with tempfile.TemporaryDirectory(prefix="duoyu-ocr-") as directory:
-        paths = []
-        for index, (post, image) in enumerate(image_refs):
-            url = image["url"]
-            parsed = urllib.parse.urlsplit(url)
-            if parsed.scheme != "https" or not parsed.hostname or not (
-                parsed.hostname == "zsxq.com" or parsed.hostname.endswith(".zsxq.com")
-            ):
-                raise RuntimeError(f"图片 URL 不属于可信 HTTPS 星球域名：{parsed.hostname}")
-            try:
-                request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with API_OPENER.open(request, timeout=30) as response:
-                    mime = response.headers.get_content_type()
-                    if mime not in ("image/jpeg", "image/png", "image/webp", "image/heic", "image/gif"):
-                        raise RuntimeError(f"图片响应格式不支持：{mime}")
-                    payload = response.read(20_000_001)
-                    if len(payload) > 20_000_000:
-                        raise RuntimeError("单张图片超过 20 MB")
-            except (OSError, urllib.error.URLError) as exc:
-                raise RuntimeError(f"图片下载失败（帖子 {post['topic_id']}）：{exc}") from exc
-            image["data_uri"] = f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
-            path = Path(directory) / f"image-{index}"
-            path.write_bytes(payload)
-            paths.append(str(path))
+        return None
+    directory = Path(tempfile.mkdtemp(prefix=prefix + ".images.", dir=output_dir))
+    paths = []
+    for post, image, index in image_refs:
+        url = image["url"]
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or not (
+            parsed.hostname == "zsxq.com" or parsed.hostname.endswith(".zsxq.com")
+        ):
+            raise RuntimeError(f"图片 URL 不属于可信 HTTPS 星球域名：{parsed.hostname}")
         try:
-            result = subprocess.run(["swift", str(Path(__file__).with_name("recognize_images.swift")), *paths],
-                                    capture_output=True, text=True, check=True, timeout=300)
-            recognized = json.loads(result.stdout)
-            if not isinstance(recognized, list) or len(recognized) != len(paths) or any(not isinstance(text, str) for text in recognized):
-                raise RuntimeError("OCR 返回条目数或类型不匹配")
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"图片 OCR 失败：{exc.stderr.strip()}") from exc
-        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-            raise RuntimeError(f"图片 OCR 失败：{exc}") from exc
-        for (_, image), text in zip(image_refs, recognized):
-            image["ocr"] = text.strip()
+            request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with API_OPENER.open(request, timeout=30) as response:
+                mime = response.headers.get_content_type()
+                if mime not in ("image/jpeg", "image/png", "image/webp", "image/heic", "image/gif"):
+                    raise RuntimeError(f"图片响应格式不支持：{mime}")
+                payload = response.read(20_000_001)
+                if len(payload) > 20_000_000:
+                    raise RuntimeError("单张图片超过 20 MB")
+        except (OSError, urllib.error.URLError) as exc:
+            raise RuntimeError(f"图片下载失败（帖子 {post['topic_id']}）：{exc}") from exc
+        target = directory / f"{post['topic_id']}-{index}.jpg"
+        if mime == "image/jpeg":
+            target.write_bytes(payload)
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".src", dir=directory, delete=False) as source:
+                source.write(payload)
+                source_name = source.name
+            try:
+                converted = subprocess.run(
+                    ["sips", "-s", "format", "jpeg", source_name, "--out", str(target)],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(f"图片转 JPEG 失败（帖子 {post['topic_id']}）：{exc}") from exc
+            finally:
+                Path(source_name).unlink(missing_ok=True)
+            if converted.returncode != 0 or not target.exists():
+                raise RuntimeError(
+                    f"图片转 JPEG 失败（帖子 {post['topic_id']}）：{converted.stderr.strip()}"
+                )
+        image["file"] = f"images/{post['topic_id']}-{index}.jpg"
+        paths.append(str(target))
+    try:
+        result = subprocess.run(["swift", str(Path(__file__).with_name("recognize_images.swift")), *paths],
+                                capture_output=True, text=True, check=True, timeout=300)
+        recognized = json.loads(result.stdout)
+        if not isinstance(recognized, list) or len(recognized) != len(paths) or any(not isinstance(text, str) for text in recognized):
+            raise RuntimeError("OCR 返回条目数或类型不匹配")
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"图片 OCR 失败：{exc.stderr.strip()}") from exc
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise RuntimeError(f"图片 OCR 失败：{exc}") from exc
+    for (_, image, _), text in zip(image_refs, recognized):
+        image["ocr"] = text.strip()
+    return directory
 
 
 def decode_e_tags(s: str) -> str:
@@ -543,13 +568,19 @@ def format_topic(topic: dict) -> dict | None:
         owner = talk.get("owner", {}).get("name", "") if talk else ""
         answer_owner = ""
 
-    # 构建完整帖子纯文本
+    # 构建完整帖子纯文本；星主提问/回答者用 **加粗** 便于分析阶段识别
     if ttype == "q&a":
-        full_text = ""
+        parts = []
         if q_text:
-            full_text += f"{owner} 提问：\n\n{q_text}\n\n"
+            label = f"**{owner}** 提问：" if is_focus_author(owner) else f"{owner} 提问："
+            parts.append(f"{label}\n\n{q_text}")
         if a_text:
-            full_text += f"{answer_owner} 回答：\n\n{a_text}"
+            label = (
+                f"**{answer_owner}** 回答：" if is_focus_author(answer_owner)
+                else f"{answer_owner} 回答："
+            )
+            parts.append(f"{label}\n\n{a_text}")
+        full_text = "\n\n".join(parts)
     else:
         full_text = text
 
@@ -605,7 +636,7 @@ def build_focus_counts(posts: list[dict], qa_posts: list[dict]) -> dict[str, int
     }
 
 
-def generate_html(
+def generate_markdown(
     posts: list[dict],
     qa_posts: list[dict],
     start_date: str,
@@ -614,240 +645,127 @@ def generate_html(
     daily_counts: dict[str, int],
     filtered_count: int,
     no_filter: bool,
+    images_dir_name: str,
 ) -> str:
-    """生成自包含 raw-only HTML，用户提问单独归入专属分区。"""
+    """生成与大锅饭同标题约定的 raw Markdown；附图为旁路占位符 + OCR 文本。"""
     now = datetime.now(CST).strftime("%Y-%m-%d %H:%M")
 
     if no_filter:
-        count_text = (
-            f"输出帖子：帖子与发言 {len(posts)} 篇 | 用户提问 {len(qa_posts)} 篇"
+        count_line = (
+            f"> 输出帖子：帖子与发言 {len(posts)} 篇 | 用户提问 {len(qa_posts)} 篇"
             f" | 日期范围内 {len(fetch_result.topics)} 篇"
         )
     else:
-        count_text = (
-            f"输出帖子：帖子与发言 {len(posts)} 篇 | 用户提问 {len(qa_posts)} 篇"
+        count_line = (
+            f"> 输出帖子：帖子与发言 {len(posts)} 篇 | 用户提问 {len(qa_posts)} 篇"
             f" | 评分过滤 {filtered_count} 篇 | 日期范围内 {len(fetch_result.topics)} 篇"
         )
-    audit_text = (
-        f"抓取审计：API 分页返回 {fetch_result.api_item_count} 条"
+    audit_line = (
+        f"> 抓取审计：API 分页返回 {fetch_result.api_item_count} 条"
         f" | 日期范围外 {fetch_result.outside_date_count} 条"
         f" | 分页重复 {fetch_result.duplicate_count} 条"
         f" | 成功请求 {fetch_result.page_count} 页"
     )
-    daily_text = "逐日数量：" + " | ".join(
+    daily_line = "> 逐日数量：" + " | ".join(
         f"{day} {count} 篇" for day, count in daily_counts.items()
     )
     focus_counts = build_focus_counts(posts, qa_posts)
-    focus_text = (
-        f"重点星主：关联卡片 {focus_counts['cards']} 篇"
+    focus_line = (
+        f"> 重点星主：关联卡片 {focus_counts['cards']} 篇"
         f" | 发言/提问 {focus_counts['authored']} 条"
         f" | 回答 {focus_counts['answers']} 条"
         f" | 评论 {focus_counts['comments']} 条"
     )
     image_count = sum(len(post.get("images", [])) for post in posts + qa_posts)
-    image_text = f"附图 OCR：{image_count} 张（图片内嵌，识别结果逐图展示）"
-
-    def escape(value: object) -> str:
-        return html.escape(str(value), quote=True)
-
-    def render_list(label: str, values: list[str], css_class: str) -> str:
-        if not values:
-            return ""
-        items = "".join(f"<li>{escape(value)}</li>" for value in values)
-        return (
-            f'<div class="post-extra {css_class}">'
-            f'<h4>{escape(label)}</h4><ul>{items}</ul></div>'
-        )
-
-    def render_images(images: list[dict[str, str]]) -> str:
-        if not images:
-            return ""
-        items = []
-        for index, image in enumerate(images, 1):
-            recognized = image["ocr"] or "未识别出文字；请查看原图。"
-            items.append(
-                f'<figure><img src="{escape(image["data_uri"])}" alt="附件图片 {index}" loading="lazy">'
-                f'<figcaption>图片 {index} · {escape(image["section"])} · OCR 原文</figcaption>'
-                f'<pre class="raw-content ocr-content">{escape(recognized)}</pre></figure>'
-            )
-        return '<div class="post-extra post-images"><h4>附图与文字识别</h4>' + "".join(items) + '</div>'
-
-    def render_identity(name: str, css_class: str = "owner") -> str:
-        if not name:
-            return ""
-        focused = is_focus_author(name)
-        classes = f'{css_class} focus-person' if focused else css_class
-        badge = '<span class="star-badge">星主</span>' if focused else ""
-        return f'<span class="{classes}">{escape(name)}{badge}</span>'
-
-    def render_comments(comments: list[dict[str, str]]) -> str:
-        if not comments:
-            return ""
-        items = []
-        for comment in comments:
-            comment_owner = comment["owner"]
-            focused = is_focus_author(comment_owner)
-            item_class = ' class="star-reply"' if focused else ""
-            identity = render_identity(comment_owner, "comment-owner")
-            separator = "：" if comment_owner else ""
-            items.append(
-                f'<li{item_class}>{identity}{escape(separator + comment["text"])}</li>'
-            )
-        return (
-            '<div class="post-extra comments"><h4>评论预览</h4><ul>'
-            + "".join(items)
-            + "</ul></div>"
-        )
-
-    def render_qna_content(post: dict) -> str:
-        parts = []
-        if post["question_text"]:
-            question_identity = render_identity(post["owner"], "qna-owner")
-            parts.append(
-                '<div class="qna-part question-part">'
-                f'<h4>提问 {question_identity}</h4>'
-                f'<pre class="raw-content">{escape(post["question_text"])}</pre></div>'
-            )
-        if post["answer_text"]:
-            focused = is_focus_author(post["answer_owner"])
-            answer_class = "qna-part answer-part star-reply" if focused else "qna-part answer-part"
-            answer_identity = render_identity(post["answer_owner"], "qna-owner")
-            parts.append(
-                f'<div class="{answer_class}">'
-                f'<h4>回答 {answer_identity}</h4>'
-                f'<pre class="raw-content">{escape(post["answer_text"])}</pre></div>'
-            )
-        return '<div class="qna-content">' + "".join(parts) + "</div>"
-
-    def render_post(post: dict, question: bool = False) -> str:
-        score_text = f"{post['score']} 分" if post["score"] is not None else "无评分"
-        created = post["created"] or ""
-        if created:
-            time_text = datetime.fromisoformat(created).strftime("%m-%d %H:%M")
-        else:
-            time_text = "未知时间"
-        owner_focused = is_focus_author(post["owner"])
-        answer_focused = has_focus_answer(post)
-        card_focused = owner_focused
-        if question:
-            post_kind = "星主提问" if owner_focused else "用户提问"
-        else:
-            post_kind = "星主发言" if owner_focused else "帖子"
-        owner = render_identity(post["owner"])
-        tags = render_list("标签", post["tags"], "tags")
-        files = render_list("附件", post["files"], "files")
-        comments = render_comments(post["comments"])
-        card_class = "post-card star-highlight" if card_focused else "post-card"
-        focus_attr = ' data-focus-star="true"' if card_focused else ""
-        content = (
-            render_qna_content(post)
-            if question
-            else f'<pre class="raw-content">{escape(post["text"])}</pre>'
-        )
-        return (
-            f'<article class="{card_class}" data-post-id="{escape(post["topic_id"])}" '
-            f'data-timestamp="{escape(created)}"{focus_attr}>'
-            '<header class="post-meta">'
-            f'<span class="kind">{post_kind}</span>'
-            f'<time datetime="{escape(created)}">{escape(time_text)}</time>'
-            f'<span class="score">{escape(score_text)}</span>{owner}'
-            '</header>'
-            f'<h3>{escape(post["title"])}</h3>'
-            f'{content}{render_images(post.get("images", []))}{tags}{files}{comments}'
-            '</article>'
-        )
-
-    host_cards = "".join(render_post(post) for post in posts)
-    question_cards = "".join(render_post(post, question=True) for post in qa_posts)
-    if not host_cards:
-        host_cards = '<p class="empty">该日期范围内没有帖子或发言。</p>'
-    if not question_cards:
-        question_cards = '<p class="empty">该日期范围内没有用户提问。</p>'
-
-    document_start = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>多鱼朋友圈 · 原始数据</title>
-<style>
-:root { color-scheme: light dark; --bg:#f4f1ea; --panel:#fffdf8; --text:#25221d; --muted:#736d63; --line:#d9d1c3; --accent:#b4532a; --accent-soft:#f4dfd2; --star-bg:#fff4cc; --star-line:#d99b16; --star-text:#704500; }
-@media (prefers-color-scheme: dark) { :root { --bg:#171613; --panel:#22201c; --text:#f4efe7; --muted:#b8afa3; --line:#454038; --accent:#f0a47d; --accent-soft:#492b20; --star-bg:#3b3018; --star-line:#d8a33a; --star-text:#ffd67a; } }
-* { box-sizing:border-box; }
-body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; line-height:1.7; }
-a { color:var(--accent); }
-.page { width:min(1080px, calc(100% - 32px)); margin:32px auto 64px; }
-.hero, .section { background:var(--panel); border:1px solid var(--line); border-radius:18px; box-shadow:0 12px 32px rgba(0,0,0,.06); }
-.hero { padding:32px; }
-.eyebrow { color:var(--accent); font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
-h1 { margin:.2rem 0 .5rem; font-size:clamp(2rem,5vw,3.6rem); line-height:1.15; }
-.subtitle, .audit-row, .empty { color:var(--muted); }
-.audit { display:grid; gap:8px; margin-top:22px; padding:18px; background:var(--accent-soft); border-radius:14px; }
-.audit-row { margin:0; overflow-wrap:anywhere; }
-.nav { display:flex; flex-wrap:wrap; gap:10px; margin-top:20px; }
-.nav a { padding:8px 12px; border:1px solid var(--line); border-radius:999px; text-decoration:none; }
-.section { margin-top:24px; padding:28px; }
-.section-heading { display:flex; justify-content:space-between; gap:16px; align-items:baseline; border-bottom:1px solid var(--line); margin-bottom:20px; }
-.section-heading h2 { margin:0 0 12px; }
-.section-heading span { color:var(--muted); }
-.post-card { padding:22px 0; border-bottom:1px solid var(--line); }
-.post-card:last-child { border-bottom:0; }
-.post-card.star-highlight { margin:12px 0; padding:22px; border:2px solid var(--star-line); border-radius:14px; background:var(--star-bg); box-shadow:0 8px 20px rgba(159,105,0,.10); }
-.post-meta { display:flex; flex-wrap:wrap; gap:8px 12px; color:var(--muted); font-size:.92rem; }
-.kind, .score { color:var(--accent); font-weight:700; }
-.focus-person { color:var(--star-text); font-weight:800; }
-.star-badge { display:inline-block; margin-left:6px; padding:1px 7px; border:1px solid var(--star-line); border-radius:999px; background:var(--star-bg); color:var(--star-text); font-size:.78rem; line-height:1.5; vertical-align:middle; }
-.focus-note { margin:18px 0 0; padding:12px 14px; border-left:4px solid var(--star-line); border-radius:8px; background:var(--star-bg); color:var(--star-text); }
-.post-card h3 { margin:10px 0 14px; font-size:1.25rem; }
-.raw-content { margin:0; padding:16px; background:color-mix(in srgb, var(--bg) 72%, transparent); border-radius:12px; white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; }
-.qna-content { display:grid; gap:12px; }
-.qna-part { padding:14px; border:1px solid var(--line); border-radius:12px; }
-.qna-part h4 { margin:0 0 8px; }
-.qna-part.star-reply, .comments li.star-reply { border-color:var(--star-line); background:var(--star-bg); }
-.comments li.star-reply { margin:6px 0; padding:8px 10px; border-left:4px solid var(--star-line); border-radius:6px; list-style-position:inside; }
-.post-extra { margin-top:16px; }
-.post-extra h4 { margin:0 0 6px; color:var(--muted); font-size:.92rem; }
-.post-extra ul { margin:0; padding-left:1.4rem; }
-.post-images figure { margin:12px 0; }
-.post-images img { display:block; max-width:100%; height:auto; border-radius:10px; }
-.post-images figcaption { color:var(--muted); margin:6px 0; }
-footer { margin-top:24px; color:var(--muted); text-align:center; }
-@media (max-width:640px) { .page { width:min(100% - 20px,1080px); margin-top:10px; } .hero,.section { border-radius:13px; padding:20px; } .section-heading { display:block; } }
-</style>
-</head>
-<body>
-<div class="page">
-"""
-    body = (
-        '<header class="hero">'
-        '<div class="eyebrow">ZSXQ RAW EXPORT</div>'
-        f'<h1>{escape(GROUP_NAME)}</h1>'
-        '<p class="subtitle">自包含 HTML · 只做抓取与排版，不生成摘要</p>'
-        f'<p>来源：<a href="{escape(GROUP_URL)}">{escape(GROUP_URL)}</a></p>'
-        f'<p>导出时间：{escape(now)} · 日期范围：{escape(start_date)} ～ {escape(end_date)}</p>'
-        '<p class="focus-note"><span class="star-badge">星主</span> 重点关注：求学、大牛；他们的发言、回答和评论会以金色高亮。</p>'
-        '<div class="audit">'
-        f'<p class="audit-row">{escape(count_text)}</p>'
-        f'<p class="audit-row">{escape(audit_text)}</p>'
-        f'<p class="audit-row">{escape(daily_text)}</p>'
-        f'<p class="audit-row">{escape(focus_text)}</p>'
-        f'<p class="audit-row">{escape(image_text)}</p>'
-        '</div>'
-        '<nav class="nav" aria-label="页面分区">'
-        f'<a href="#host-posts">帖子与发言 {len(posts)}</a>'
-        f'<a href="#questions">用户提问 {len(qa_posts)}</a>'
-        '</nav></header>'
-        '<main>'
-        '<section id="host-posts" class="section">'
-        f'<div class="section-heading"><h2>帖子与发言</h2><span>{len(posts)} 篇</span></div>'
-        f'{host_cards}</section>'
-        '<section id="questions" class="section">'
-        f'<div class="section-heading"><h2>用户提问</h2><span>{len(qa_posts)} 篇</span></div>'
-        f'{question_cards}</section>'
-        '</main>'
-        f'<footer>生成于 {escape(now)} · 页面不依赖外部脚本或样式</footer>'
+    image_line = (
+        f"> 附图 OCR：{image_count} 张（原图存旁路目录 {images_dir_name}/，"
+        "markdown 内为占位符与识别文本）"
     )
-    return document_start + body + "</div>\n</body>\n</html>\n"
+
+    lines = [
+        f"# {GROUP_NAME}（原始数据）",
+        "",
+        f"> 来源：{GROUP_URL}",
+        f"> 导出时间：{now}",
+        f"> 日期范围：{start_date} ~ {end_date}",
+        count_line,
+        audit_line,
+        daily_line,
+        focus_line,
+        image_line,
+        "",
+        "---",
+    ]
+
+    def append_post(post: dict, question: bool = False) -> None:
+        score_str = f"{post['score']}" if post["score"] is not None else "无"
+        if post["created"]:
+            time_str = datetime.fromisoformat(post["created"]).strftime("%m-%d %H:%M")
+        else:
+            time_str = "未知"
+        title = str(post["title"]).replace("\n", " ").replace("|", "｜")
+        prefix = "### ❓ ⭐" if question else "## ⭐"
+        lines.append("")
+        lines.append(
+            f"{prefix} {score_str}分 | {time_str} | {title} | ID `{post['topic_id']}`"
+        )
+        lines.append("")
+        lines.append(post["text"])
+
+        for index, image in enumerate(post.get("images", []), 1):
+            file_name = image.get("file") or f"images/{post['topic_id']}-{index}.jpg"
+            lines.append("")
+            lines.append(f"![图{index}]({file_name})")
+            ocr = image.get("ocr") or ""
+            if ocr:
+                lines.append("")
+                lines.append(f"**图片OCR（图{index}）**：")
+                lines.append("")
+                lines.append("```")
+                lines.append(ocr)
+                lines.append("```")
+            else:
+                lines.append("")
+                lines.append(f"图{index}未识别出文字；请查看旁路目录原图。")
+
+        if post["tags"]:
+            lines.append("")
+            lines.append(f"**标签**：{' '.join(post['tags'])}")
+
+        if post["files"]:
+            lines.append("")
+            lines.append(f"**附件**：{', '.join(post['files'])}")
+
+        if post["comments"]:
+            lines.append("")
+            lines.append("评论原文：")
+            for comment in post["comments"]:
+                owner = comment["owner"].strip()
+                if is_focus_author(owner):
+                    lines.append(f"**{owner}**：{comment['text']}")
+                else:
+                    lines.append(f"{owner}：{comment['text']}")
+
+        lines.append("")
+        lines.append("---")
+
+    for post in posts:
+        append_post(post)
+
+    if qa_posts:
+        lines.extend(
+            [
+                "",
+                "## 🙋 用户提问",
+                "",
+                "> 本章节保留日期范围内抓取到的全部用户提问及回答，按发布时间降序排列，不参与评分过滤。",
+            ]
+        )
+        for post in qa_posts:
+            append_post(post, question=True)
+
+    lines.append("")
+    return "\n".join(lines)
 
 
 def main():
@@ -976,13 +894,22 @@ def main():
         + (f"（评分过滤 {filtered_count} 篇）" if filtered_count > 0 else "")
     )
     print(f"保留用户提问（q&a）帖子：{len(qa_posts)} 篇，写入独立章节")
+    # 输出路径：raw markdown + 旁路图片目录 {stem}_images/
+    mmdd = now.strftime("%m%d")
+    output_path = OUTPUT_DIR / f"{mmdd}-{GROUP_NAME}_raw_{start_date}_{end_date}.md"
+    images_dir = OUTPUT_DIR / f"{output_path.stem}_images"
+
+    # 附图下载 + Vision OCR 先写入旁路临时目录；任一失败即中止，不留半成品
+    temp_images = None
     try:
-        recognize_images(all_posts + qa_posts)
-    except RuntimeError as exc:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        temp_images = prepare_images(all_posts + qa_posts, OUTPUT_DIR, output_path.name)
+    except (RuntimeError, OSError) as exc:
+        if temp_images is not None:
+            shutil.rmtree(temp_images, ignore_errors=True)
         parser.exit(1, f"导出失败：{exc}\n")
 
-    # 生成自包含 HTML
-    html_document = generate_html(
+    markdown_document = generate_markdown(
         all_posts,
         qa_posts,
         start_date,
@@ -991,14 +918,12 @@ def main():
         daily_counts,
         filtered_count,
         no_filter,
+        images_dir.name,
     )
 
-    # 写入文件
-    mmdd = now.strftime("%m%d")
-    output_path = OUTPUT_DIR / f"{mmdd}-{GROUP_NAME}_raw_{start_date}_{end_date}.html"
+    # markdown 原子覆盖写入；成功后再把旁路图片目录移动到最终位置
     temp_path = None
     try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -1008,9 +933,14 @@ def main():
             delete=False,
         ) as temp_file:
             temp_path = Path(temp_file.name)
-            temp_file.write(html_document)
+            temp_file.write(markdown_document)
         os.replace(temp_path, output_path)
         temp_path = None
+        if images_dir.exists():
+            shutil.rmtree(images_dir)
+        if temp_images is not None:
+            os.rename(temp_images, images_dir)
+            temp_images = None
     except (OSError, UnicodeError) as exc:
         cleanup_error = None
         if temp_path is not None:
@@ -1018,6 +948,8 @@ def main():
                 temp_path.unlink(missing_ok=True)
             except OSError as cleanup_exc:
                 cleanup_error = cleanup_exc
+        if temp_images is not None:
+            shutil.rmtree(temp_images, ignore_errors=True)
         message = f"导出失败：写入输出文件失败：{exc}"
         if cleanup_error is not None:
             message += f"；临时文件清理失败：{cleanup_error}"
@@ -1025,6 +957,9 @@ def main():
 
     print(f"\n导出完成！")
     print(f"文件路径：{output_path}")
+    image_count = sum(len(post.get("images", [])) for post in all_posts + qa_posts)
+    if image_count:
+        print(f"旁路图片目录：{images_dir}（{image_count} 张，已含 Vision OCR）")
     print(f"帖子与发言数量：{len(all_posts)}")
     print(f"用户提问数量：{len(qa_posts)}（已写入独立章节）")
     focus_counts = build_focus_counts(all_posts, qa_posts)

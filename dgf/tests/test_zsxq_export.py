@@ -56,6 +56,31 @@ class FetchTopicsRegressionTests(unittest.TestCase):
                 MODULE.fetch_topics("secret", "2026-11-01", "2026-11-02")
         self.assertEqual(mocked_open.call_count, 3)
 
+    def test_overlapping_pages_keep_first_topic_and_advance_cursor(self):
+        first = {"topic_id": 123, "create_time": "2026-11-02T10:00:00+08:00"}
+        overlap = {"topic_id": 123, "create_time": "2026-11-02T09:00:00+08:00"}
+        second = {"topic_id": 456, "create_time": "2026-11-02T08:00:00+08:00"}
+        pages = [
+            {"succeeded": True, "resp_data": {"topics": [first], "is_end": False}},
+            {"succeeded": True, "resp_data": {"topics": [overlap, second], "is_end": True}},
+        ]
+        with patch.object(MODULE.urllib.request, "urlopen", side_effect=map(FakeResponse, pages)) as mocked_open, patch(
+            "time.sleep", return_value=None
+        ):
+            topics = MODULE.fetch_topics("secret", "2026-11-01", "2026-11-02")
+        self.assertEqual(topics, [first, second])
+        self.assertEqual(len({str(t["topic_id"]) for t in topics}), len(topics))
+        self.assertEqual(mocked_open.call_count, 2)
+        self.assertIn("end_time=2026-11-02T10%3A00%3A00%2B08%3A00", mocked_open.call_args_list[1].args[0].full_url)
+
+    def test_missing_topic_id_fails_closed(self):
+        page = {"succeeded": True, "resp_data": {"topics": [
+            {"create_time": "2026-11-02T10:00:00+08:00"}
+        ], "is_end": True}}
+        with patch.object(MODULE.urllib.request, "urlopen", return_value=FakeResponse(page)):
+            with self.assertRaisesRegex(RuntimeError, "缺少 topic_id"):
+                MODULE.fetch_topics("secret", "2026-11-01", "2026-11-02")
+
 
 class TopicIdContractTests(unittest.TestCase):
     def test_markdown_headings_include_original_topic_id(self):

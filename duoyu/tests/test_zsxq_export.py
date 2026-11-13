@@ -19,6 +19,9 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from __common.validate import TOPIC_HEADING, load_posts
+
 
 class FakeResponse:
     def __init__(self, payload: dict):
@@ -319,6 +322,33 @@ class FetchTopicsTests(unittest.TestCase):
 
 
 class AuditOutputTests(unittest.TestCase):
+    def markdown(
+        self,
+        posts,
+        questions,
+        start="2026-11-01",
+        end="2026-11-02",
+        result=None,
+        daily=None,
+        filtered_count=0,
+        no_filter=True,
+    ):
+        if result is None:
+            result = MODULE.FetchResult(posts + questions, len(posts) + len(questions), 1, 0, 0)
+        if daily is None:
+            daily = {start: 0, end: 0}
+        return MODULE.generate_markdown(
+            posts,
+            questions,
+            start,
+            end,
+            result,
+            daily,
+            filtered_count=filtered_count,
+            no_filter=no_filter,
+            images_dir_name="out_images",
+        )
+
     def test_daily_counts_include_zero_dates_and_convert_utc_to_beijing(self):
         topics = [
             topic(2, "2026-11-01T23:30:00+08:00"),
@@ -330,28 +360,25 @@ class AuditOutputTests(unittest.TestCase):
             {"2026-10-31": 0, "2026-11-01": 2, "2026-11-02": 0},
         )
 
-    def test_question_hashtag_is_preserved_in_html_metadata(self):
+    def test_question_hashtag_is_preserved_in_markdown(self):
         source_topic = topic(1, "2026-11-02T09:00:00+08:00", "q&a")
         source_topic["question"]["text"] = (
             '问题 <e type="hashtag" hid="1" title="%23问题标签" />'
         )
         question = MODULE.format_topic(source_topic)
         self.assertEqual(question["tags"], ["#问题标签"])
-        result = MODULE.FetchResult([source_topic], 1, 1, 0, 0)
-        html_document = MODULE.generate_html(
+        document = self.markdown(
             [],
             [question],
             "2026-11-02",
             "2026-11-02",
-            result,
-            {"2026-11-02": 1},
-            filtered_count=0,
-            no_filter=True,
+            result=MODULE.FetchResult([source_topic], 1, 1, 0, 0),
+            daily={"2026-11-02": 1},
         )
-        self.assertIn("#问题标签", html_document)
-        self.assertEqual(html_document.count('class="post-card"'), 1)
+        self.assertIn("**标签**：#问题标签", document)
+        self.assertEqual(len(TOPIC_HEADING.findall(document)), 1)
 
-    def test_html_contains_unambiguous_audit_lines(self):
+    def test_markdown_contains_unambiguous_audit_lines(self):
         source_topics = [
             topic(2, "2026-11-02T09:00:00+08:00"),
             topic(1, "2026-11-01T09:00:00+08:00", "q&a"),
@@ -371,7 +398,7 @@ class AuditOutputTests(unittest.TestCase):
             "2026-11-02": 1,
         }
 
-        html_document = MODULE.generate_html(
+        document = MODULE.generate_markdown(
             posts,
             questions,
             "2026-10-31",
@@ -380,82 +407,52 @@ class AuditOutputTests(unittest.TestCase):
             daily_counts,
             filtered_count=0,
             no_filter=True,
+            images_dir_name="out_images",
         )
 
-        self.assertIn("输出帖子：帖子与发言 1 篇 | 用户提问 1 篇 | 日期范围内 2 篇", html_document)
-        self.assertIn("API 分页返回 3 条 | 日期范围外 1 条 | 分页重复 0 条", html_document)
-        self.assertIn("2026-10-31 0 篇 | 2026-11-01 1 篇 | 2026-11-02 1 篇", html_document)
-        self.assertNotIn("（API 返回", html_document)
+        self.assertTrue(document.startswith("# 多鱼朋友圈（原始数据）"))
+        self.assertIn("> 来源：https://wx.zsxq.com/group/15284854485542", document)
+        self.assertIn("> 日期范围：2026-10-31 ~ 2026-11-02", document)
+        self.assertIn("> 输出帖子：帖子与发言 1 篇 | 用户提问 1 篇 | 日期范围内 2 篇", document)
+        self.assertIn("> 抓取审计：API 分页返回 3 条 | 日期范围外 1 条 | 分页重复 0 条 | 成功请求 1 页", document)
+        self.assertIn("> 逐日数量：2026-10-31 0 篇 | 2026-11-01 1 篇 | 2026-11-02 1 篇", document)
+        self.assertIn("旁路目录 out_images/", document)
 
-    def test_html_is_self_contained_escaped_and_structurally_auditable(self):
-        posts = [
-            {
-                "topic_id": 2,
-                "type": "talk",
-                "created": "2026-11-02T09:00:00+08:00",
-                "owner": '作者 <owner> "x"',
-                "answer_owner": "",
-                "question_text": "",
-                "answer_text": "",
-                "score": 8.0,
-                "title": '<script>alert("x")</script>',
-                "text": '正文 & < > " \'',
-                "tags": ["标签 <tag>"],
-                "files": ['附件 "file"'],
-                "comments": [{"owner": "评论者", "text": "评论 <img src=x>"}],
-            }
+    def test_markdown_uses_shared_heading_and_comment_convention(self):
+        host_topic = topic(2, "2026-11-02T09:00:00+08:00")
+        host_topic["talk"]["text"] = "能量评分8.0分。星主帖正文"
+        host_topic["show_comments"] = [
+            {"owner": {"name": "大牛"}, "text": "重点评论"},
+            {"owner": {"name": "普通用户"}, "text": "普通评论"},
         ]
-        questions = [
-            {
-                "topic_id": 1,
-                "type": "q&a",
-                "created": "2026-11-01T08:00:00+08:00",
-                "owner": "用户",
-                "answer_owner": "回答者",
-                "question_text": "问题正文",
-                "answer_text": "回答正文",
-                "score": None,
-                "title": "问题",
-                "text": "用户 提问：\n\n问题正文",
-                "tags": [],
-                "files": [],
-                "comments": [],
-            }
-        ]
-        result = MODULE.FetchResult(posts + questions, 2, 1, 0, 0)
-        html_document = MODULE.generate_html(
+        question_topic = topic(1, "2026-11-01T08:00:00+08:00", "q&a")
+        posts = [MODULE.format_topic(host_topic)]
+        questions = [MODULE.format_topic(question_topic)]
+        document = self.markdown(
             posts,
             questions,
-            "2026-11-01",
-            "2026-11-02",
-            result,
-            {"2026-11-01": 1, "2026-11-02": 1},
-            filtered_count=0,
-            no_filter=True,
+            result=MODULE.FetchResult([host_topic, question_topic], 2, 1, 0, 0),
+            daily={"2026-11-01": 1, "2026-11-02": 1},
         )
 
-        self.assertTrue(html_document.startswith("<!DOCTYPE html>"))
-        self.assertIn('<meta charset="utf-8">', html_document)
-        self.assertIn('<meta name="viewport"', html_document)
-        self.assertIn('<section id="host-posts"', html_document)
-        self.assertIn('<section id="questions"', html_document)
-        self.assertEqual(html_document.count('class="post-card"'), 2)
-        self.assertEqual(set(re.findall(r'data-post-id="([^"]+)"', html_document)), {"1", "2"})
-        self.assertEqual(
-            re.findall(r'data-timestamp="([^"]+)"', html_document),
-            ["2026-11-02T09:00:00+08:00", "2026-11-01T08:00:00+08:00"],
-        )
-        self.assertNotIn('<script>alert("x")</script>', html_document)
-        self.assertIn("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;", html_document)
-        self.assertIn("正文 &amp; &lt; &gt; &quot; &#x27;", html_document)
-        self.assertIn("作者 &lt;owner&gt; &quot;x&quot;", html_document)
-        self.assertIn("标签 &lt;tag&gt;", html_document)
-        self.assertIn("评论 &lt;img src=x&gt;", html_document)
-        self.assertNotIn("<script", html_document.lower())
-        self.assertNotIn("<link", html_document.lower())
-        self.assertNotIn("src=\"http", html_document.lower())
+        self.assertIn("## ⭐ 8.0分 | 11-02 09:00 | 能量评分8.0分 | ID `2`", document)
+        self.assertIn("### ❓ ⭐ 无分 | 11-01 08:00 |", document)
+        self.assertIn("| ID `1`", document)
+        self.assertIn("## 🙋 用户提问", document)
+        self.assertIn("评论原文：", document)
+        self.assertIn("**大牛**：重点评论", document)
+        self.assertIn("普通用户：普通评论", document)
 
-    def test_focus_authors_are_highlighted_by_structured_owner_fields(self):
+        parsed = load_posts(document, {"求学", "大牛"})
+        self.assertEqual([post.topic_id for post in parsed], ["2", "1"])
+        self.assertEqual([post.is_question for post in parsed], [False, True])
+        host = parsed[0]
+        self.assertEqual(host.focus_count, 1)
+        self.assertEqual(list(host.comment_lines), ["**大牛**：重点评论", "普通用户：普通评论"])
+        self.assertEqual(host.score_display, "8.0分")
+        self.assertEqual(parsed[1].score_display, "无能量评分")
+
+    def test_focus_authors_are_marked_by_structured_owner_fields(self):
         host_topic = topic(2, "2026-11-02T09:00:00+08:00")
         host_topic["talk"]["owner"]["name"] = "求学"
         host_topic["show_comments"] = [
@@ -468,19 +465,12 @@ class AuditOutputTests(unittest.TestCase):
         normal_topic["talk"]["text"] = "正文中提到 @求学，但作者不是星主"
         posts = [MODULE.format_topic(host_topic), MODULE.format_topic(normal_topic)]
         questions = [MODULE.format_topic(question_topic)]
-        result = MODULE.FetchResult(
-            [host_topic, question_topic, normal_topic], 3, 1, 0, 0
-        )
 
-        html_document = MODULE.generate_html(
+        document = self.markdown(
             posts,
             questions,
-            "2026-11-01",
-            "2026-11-02",
-            result,
-            {"2026-11-01": 2, "2026-11-02": 1},
-            filtered_count=0,
-            no_filter=True,
+            result=MODULE.FetchResult([host_topic, question_topic, normal_topic], 3, 1, 0, 0),
+            daily={"2026-11-01": 2, "2026-11-02": 1},
         )
 
         counts = MODULE.build_focus_counts(posts, questions)
@@ -489,33 +479,16 @@ class AuditOutputTests(unittest.TestCase):
             {"cards": 2, "authored": 1, "answers": 1, "comments": 1},
         )
         self.assertIn(
-            "重点星主：关联卡片 2 篇 | 发言/提问 1 条 | 回答 1 条 | 评论 1 条",
-            html_document,
+            "> 重点星主：关联卡片 2 篇 | 发言/提问 1 条 | 回答 1 条 | 评论 1 条",
+            document,
         )
-        self.assertEqual(html_document.count('class="post-card star-highlight"'), 1)
-        self.assertEqual(html_document.count('data-focus-star="true"'), 1)
-        self.assertIn('<span class="kind">星主发言</span>', html_document)
-        self.assertIn('<span class="owner focus-person">求学<span class="star-badge">星主</span>', html_document)
-        self.assertIn('<li class="star-reply"><span class="comment-owner focus-person">大牛', html_document)
-        self.assertIn('class="qna-part answer-part star-reply"', html_document)
-        self.assertIn('<span class="qna-owner focus-person">求学', html_document)
-        # 星主回答的问答卡不应在卡片级渲染金色，仅回答区高亮
-        question_card = re.search(
-            r'<article class="post-card" data-post-id="1".*?</article>',
-            html_document,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(question_card)
-        self.assertNotIn("star-highlight", question_card.group(0))
-        self.assertNotIn("data-focus-star", question_card.group(0))
-        self.assertIn('class="qna-part answer-part star-reply"', question_card.group(0))
-        normal_card = re.search(
-            r'<article class="post-card" data-post-id="3".*?</article>',
-            html_document,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(normal_card)
-        self.assertNotIn("data-focus-star", normal_card.group(0))
+        self.assertIn("**求学** 回答：", document)
+        self.assertIn("用户 提问：", document)
+        self.assertIn("**大牛**：重点评论", document)
+        # 正文提及不算星主发言：普通帖标题行不带任何 focus 标记
+        parsed = load_posts(document, {"求学", "大牛"})
+        normal = next(post for post in parsed if post.topic_id == "3")
+        self.assertEqual(normal.focus_count, 0)
 
     def test_focus_answer_requires_nonempty_answer_text(self):
         source_topic = topic(1, "2026-11-02T09:00:00+08:00", "q&a")
@@ -526,20 +499,51 @@ class AuditOutputTests(unittest.TestCase):
             counts,
             {"cards": 0, "authored": 0, "answers": 0, "comments": 0},
         )
-        result = MODULE.FetchResult([source_topic], 1, 1, 0, 0)
-        html_document = MODULE.generate_html(
+        document = self.markdown(
             [],
             [question],
             "2026-11-02",
             "2026-11-02",
-            result,
-            {"2026-11-02": 1},
-            filtered_count=0,
-            no_filter=True,
+            result=MODULE.FetchResult([source_topic], 1, 1, 0, 0),
+            daily={"2026-11-02": 1},
         )
-        self.assertNotIn('class="post-card star-highlight"', html_document)
-        self.assertNotIn('data-focus-star="true"', html_document)
-        self.assertNotIn('class="qna-part answer-part', html_document)
+        self.assertNotIn("回答：", document)
+        self.assertNotIn("**大牛**", document)
+
+    def test_image_placeholders_and_ocr_blocks_reference_bypass_dir(self):
+        post = {
+            "topic_id": 2,
+            "type": "talk",
+            "created": "2026-11-02T09:00:00+08:00",
+            "owner": "多鱼",
+            "answer_owner": "",
+            "question_text": "",
+            "answer_text": "",
+            "score": None,
+            "title": "附图帖",
+            "text": "附图帖正文",
+            "tags": [],
+            "files": [],
+            "comments": [],
+            "images": [
+                {"section": "talk", "url": "https://images.zsxq.com/a", "file": "images/2-1.jpg", "ocr": "识别文本"},
+                {"section": "talk", "url": "https://images.zsxq.com/b", "file": "images/2-2.jpg", "ocr": ""},
+            ],
+        }
+        document = self.markdown(
+            [post],
+            [],
+            "2026-11-02",
+            "2026-11-02",
+            daily={"2026-11-02": 1},
+        )
+        self.assertIn("![图1](images/2-1.jpg)", document)
+        self.assertIn("**图片OCR（图1）**：", document)
+        self.assertIn("```\n识别文本\n```", document)
+        self.assertIn("![图2](images/2-2.jpg)", document)
+        self.assertIn("图2未识别出文字；请查看旁路目录原图。", document)
+        self.assertNotIn("base64", document)
+        self.assertIn("> 附图 OCR：2 张", document)
 
 
 class CredentialFileTests(unittest.TestCase):
@@ -607,7 +611,7 @@ class CredentialFileTests(unittest.TestCase):
 
 
 class MainWorkflowTests(unittest.TestCase):
-    def test_main_writes_audited_html_in_time_order_atomically(self):
+    def test_main_writes_audited_markdown_in_time_order_atomically(self):
         source_topics = [
             {
                 **topic(1, "2026-11-01T09:00:00+08:00"),
@@ -669,16 +673,18 @@ class MainWorkflowTests(unittest.TestCase):
             self.assertEqual(len(set(temp_names)), 2)
             self.assertEqual(mocked_replace.call_count, 2)
 
-            outputs = list(root.glob("*-多鱼朋友圈_raw_2026-11-01_2026-11-02.html"))
+            outputs = list(root.glob("*-多鱼朋友圈_raw_2026-11-01_2026-11-02.md"))
             self.assertEqual(len(outputs), 1)
             self.assertFalse(list(root.glob("*.tmp")))
-            html_document = outputs[0].read_text(encoding="utf-8")
-            self.assertTrue(html_document.startswith("<!DOCTYPE html>"))
-            self.assertLess(html_document.index("较新帖子"), html_document.index("较早帖子"))
-            self.assertIn("日期范围内 3 篇", html_document)
-            self.assertIn("API 分页返回 4 条", html_document)
-            self.assertIn("2026-11-01 1 篇 | 2026-11-02 2 篇", html_document)
-            self.assertEqual(html_document.count('class="post-card"'), 3)
+            document = outputs[0].read_text(encoding="utf-8")
+            self.assertTrue(document.startswith("# 多鱼朋友圈（原始数据）"))
+            self.assertLess(document.index("较新帖子"), document.index("较早帖子"))
+            self.assertIn("日期范围内 3 篇", document)
+            self.assertIn("API 分页返回 4 条", document)
+            self.assertIn("2026-11-01 1 篇 | 2026-11-02 2 篇", document)
+            self.assertEqual(len(TOPIC_HEADING.findall(document)), 3)
+            self.assertEqual(document.count("## ⭐ "), 2)
+            self.assertEqual(document.count("### ❓ ⭐ "), 1)
 
     def test_replace_failure_preserves_old_output_and_removes_temp_file(self):
         source_topics = [topic(1, "2026-11-02T09:00:00+08:00")]
@@ -690,7 +696,7 @@ class MainWorkflowTests(unittest.TestCase):
             env_file.write_text("ZSXQ_ACCESS_TOKEN=fake-token\n", encoding="utf-8")
             env_file.chmod(0o600)
             mmdd = MODULE.datetime.now(MODULE.CST).strftime("%m%d")
-            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.html"
+            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
             output_path.write_text("existing complete output", encoding="utf-8")
             argv = [
                 "zsxq_export.py",
@@ -724,7 +730,7 @@ class MainWorkflowTests(unittest.TestCase):
             env_file.write_text("ZSXQ_ACCESS_TOKEN=fake-token\n", encoding="utf-8")
             env_file.chmod(0o600)
             mmdd = MODULE.datetime.now(MODULE.CST).strftime("%m%d")
-            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.html"
+            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
             output_path.write_text("existing complete output", encoding="utf-8")
             forced_temp_path = root / "forced-partial.tmp"
 
@@ -776,7 +782,7 @@ class MainWorkflowTests(unittest.TestCase):
             env_file.write_text("ZSXQ_ACCESS_TOKEN=fake-token\n", encoding="utf-8")
             env_file.chmod(0o600)
             mmdd = MODULE.datetime.now(MODULE.CST).strftime("%m%d")
-            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.html"
+            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
             output_path.write_text("existing complete output", encoding="utf-8")
             argv = [
                 "zsxq_export.py",
@@ -837,13 +843,14 @@ class MainWorkflowTests(unittest.TestCase):
             ), patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
                 MODULE.main()
 
-            html_document = next(root.glob("*-多鱼朋友圈_raw_2026-11-02_2026-11-02.html")).read_text(
+            document = next(root.glob("*-多鱼朋友圈_raw_2026-11-02_2026-11-02.md")).read_text(
                 encoding="utf-8"
             )
-            self.assertIn("高分星主帖", html_document)
-            self.assertNotIn("低分星主帖", html_document)
-            self.assertIn('<h4>提问 <span class="qna-owner">用户</span></h4>', html_document)
-            self.assertIn("评分过滤 1 篇", html_document)
+            self.assertIn("高分星主帖", document)
+            self.assertNotIn("低分星主帖", document)
+            self.assertIn("用户 提问：", document)
+            self.assertIn("多鱼 回答：", document)
+            self.assertIn("评分过滤 1 篇", document)
 
     def test_filter_options_reject_conflict_and_nonfinite_score(self):
         invalid_argvs = [

@@ -96,6 +96,7 @@ def fetch_topics(token: str, start_date: str, end_date: str) -> list[dict]:
     }
 
     all_topics = []
+    seen_topic_ids: set[str] = set()
     end_time = None
     start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=CST)
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
@@ -152,6 +153,12 @@ def fetch_topics(token: str, start_date: str, end_date: str) -> list[dict]:
                 should_stop = True
                 break
 
+            topic_id = str(t.get("topic_id", "")).strip()
+            if not topic_id:
+                raise RuntimeError("帖子缺少 topic_id，取消导出")
+            if topic_id in seen_topic_ids:
+                continue
+            seen_topic_ids.add(topic_id)
             all_topics.append(t)
 
         if should_stop or not topics:
