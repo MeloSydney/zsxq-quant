@@ -18,7 +18,7 @@ Usage:
 """
 
 import argparse
-from html import unescape
+from html import escape
 import os
 from pathlib import Path
 import re
@@ -33,6 +33,34 @@ ARTICLE = re.compile(r'(<article\b[^>]*\bclass="post-card"[^>]*\bdata-post-id="(
 STANCE = re.compile(r'<p\b[^>]*\bclass="market-stance"[^>]*>.*?</p>', re.S)
 RAW_BLOCK = re.compile(r'<details\b[^>]*\bclass="raw-block"[^>]*>\s*<summary>查看原文</summary>\s*<pre>(.*?)</pre>\s*</details>', re.S)
 DEFAULT_ORIGIN = "人工分析标注 · 非原帖能量评分"
+TITLE = re.compile(r'\bdata-title="([^"]*)"')
+TIMESTAMP = re.compile(r'\bdata-ts="([^"]+)"')
+TIMELINE = re.compile(r'<div class="score-timeline"[^>]*>.*?</div>', re.S)
+
+
+def timeline_html(cards, reviewed) -> str:
+    """Use card order and headings, not titles as keys (titles need not be unique)."""
+    lines = ['<div class="score-timeline" aria-label="市场评分时间线">',
+             '<h2>市场评分时间线</h2>', '<ol>']
+    previous_day = None
+    for card in cards:
+        title = TITLE.search(card.group(1))
+        timestamp = TIMESTAMP.search(card.group(1))
+        if title is None or timestamp is None:
+            raise ValueError(f"帖子 {card.group(2)} 缺少标题或完整发布时间")
+        when = timestamp.group(1)
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}', when):
+            raise ValueError(f"帖子 {card.group(2)} 发布时间格式无效：{when}")
+        day = when[:10]
+        separator = ' class="new-day"' if previous_day is not None and previous_day != day else ''
+        score = reviewed[card.group(2)].score
+        score_text = f'{score:+d}' if score else '0'
+        lines.append(f'<li{separator} data-post-id="{escape(card.group(2), quote=True)}">'
+                     f'<strong>{score_text}</strong> · <span>{title.group(1)}</span> · '
+                     f'<time datetime="{escape(when, quote=True)}">{escape(when)}</time></li>')
+        previous_day = day
+    lines.extend(['</ol>', '</div>'])
+    return '\n'.join(lines)
 
 
 def apply(draft: str, records, origin: str = DEFAULT_ORIGIN) -> str:
@@ -68,6 +96,12 @@ def apply(draft: str, records, origin: str = DEFAULT_ORIGIN) -> str:
                 raise ValueError(f"帖子 {card.group(2)} 缺少摘要结束标签")
             body = body[:end + 6] + annotation + body[end + 6:]
         draft = draft[:card.start()] + card.group(1) + body + card.group(4) + draft[card.end():]
+    if TIMELINE.search(draft):
+        raise ValueError("分析 HTML 已有市场评分时间线")
+    if draft.count('<div class="legend">') != 1:
+        raise ValueError("分析 HTML 缺少唯一五档图例")
+    timeline = timeline_html(cards, reviewed)
+    draft = draft.replace('<div class="legend">', timeline + '\n<div class="legend">', 1)
     return install_stance_style(draft, "reviewed-stance")
 
 

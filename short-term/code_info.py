@@ -10,9 +10,11 @@ http.client 均会被断连，curl 正常）。因此在 efinance 的共享 sess
 一个走 curl 子进程的 HTTPAdapter（含 3 次重试）；efinance 的 API 层不受
 影响，勿移除该兼容层。
 """
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 import subprocess
 import sys
-import time
+import time as clock
 
 import requests
 import requests.adapters
@@ -49,7 +51,7 @@ class _CurlAdapter(requests.adapters.HTTPAdapter):
             last_err = p.stderr[:200]
             if attempt == 2:
                 raise requests.exceptions.ConnectionError(f"curl failed: {last_err!r}")
-            time.sleep(1.5)
+            clock.sleep(1.5)
         raise requests.exceptions.ConnectionError("unreachable")
 
 
@@ -65,6 +67,12 @@ def resolve(code: str) -> str:
         h = ef.stock.get_quote_history(code)
         if h is None or h.empty:
             return f"{code} 解析失败(无数据)"
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        # efinance can return a current-day intraday snapshot labelled as 收盘.
+        latest_complete = now.date() if now.time() >= time(15, 5) else now.date() - timedelta(days=1)
+        h = h[h["日期"].astype(str) <= latest_complete.isoformat()]
+        if h.empty:
+            return f"{code} 解析失败(尚无完整收盘行情)"
         name = str(h["股票名称"].iloc[0])
         rows = h.tail(3)[["日期", "收盘", "涨跌幅"]].itertuples(index=False)
         recent = "; ".join(f"{r.日期} 收{r.收盘:g} {r.涨跌幅:+.2f}%" for r in rows)

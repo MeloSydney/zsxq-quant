@@ -775,7 +775,7 @@ def main():
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE, help="token 所在的 .env 文件路径")
     parser.add_argument("--start", help="开始日期 YYYY-MM-DD")
     parser.add_argument("--end", help="结束日期 YYYY-MM-DD")
-    parser.add_argument("--days", type=int, default=3, help="最近N天（默认3天）")
+    parser.add_argument("--days", type=int, default=5, help="最近N天（默认5天）")
     filter_group = parser.add_mutually_exclusive_group()
     filter_group.add_argument("--no-filter", action="store_true", help="不按能量评分过滤，保留所有帖子")
     filter_group.add_argument("--min-score", type=float, default=None, help="最低能量评分过滤阈值（默认不过滤）")
@@ -894,16 +894,17 @@ def main():
         + (f"（评分过滤 {filtered_count} 篇）" if filtered_count > 0 else "")
     )
     print(f"保留用户提问（q&a）帖子：{len(qa_posts)} 篇，写入独立章节")
-    # 输出路径：raw markdown + 旁路图片目录 {stem}_images/
+    # Only published HTML belongs in OUTPUT_DIR; raw and sidecar images live below it.
+    raw_dir = OUTPUT_DIR / "_temp-file"
     mmdd = now.strftime("%m%d")
-    output_path = OUTPUT_DIR / f"{mmdd}-{GROUP_NAME}_raw_{start_date}_{end_date}.md"
-    images_dir = OUTPUT_DIR / f"{output_path.stem}_images"
+    output_path = raw_dir / f"{mmdd}-{GROUP_NAME}_raw_{start_date}_{end_date}.md"
+    images_dir = raw_dir / f"{output_path.stem}_images"
 
     # 附图下载 + Vision OCR 先写入旁路临时目录；任一失败即中止，不留半成品
     temp_images = None
     try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        temp_images = prepare_images(all_posts + qa_posts, OUTPUT_DIR, output_path.name)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        temp_images = prepare_images(all_posts + qa_posts, raw_dir, output_path.name)
     except (RuntimeError, OSError) as exc:
         if temp_images is not None:
             shutil.rmtree(temp_images, ignore_errors=True)
@@ -927,7 +928,7 @@ def main():
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=OUTPUT_DIR,
+            dir=raw_dir,
             prefix=output_path.name + ".",
             suffix=".tmp",
             delete=False,

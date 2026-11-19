@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import urllib.parse
+from html.parser import HTMLParser
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -449,6 +450,71 @@ def render_comments(comments: list[dict]) -> list[str]:
 
 
 
+class ArticleContent(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.depth = 0
+        self.parts = []
+        self.images = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        fields = dict(attrs)
+        if self.depth:
+            if tag not in ("img", "br", "hr", "input", "meta", "link"):
+                self.depth += 1
+            if tag in ("p", "br", "li", "h1", "h2", "h3"):
+                self.parts.append("\n")
+            if tag == "img" and (fields.get("src") or "").startswith("https://article-images.zsxq.com/"):
+                url = fields["src"]
+                if url not in self.images:
+                    self.images.append(url)
+                    self.parts.append(f"\n[长文图片 {len(self.images)}]\n")
+        elif tag == "div" and "content" in (fields.get("class") or "").split() and "ql-editor" in (fields.get("class") or "").split():
+            self.depth = 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.depth:
+            if tag in ("p", "li", "h1", "h2", "h3"):
+                self.parts.append("\n")
+            self.depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.depth:
+            self.parts.append(data)
+
+
+def fetch_article(article: dict, token: str) -> str:
+    """Include a linked ZSXQ article and OCR its image-only tables in the raw post."""
+    article_id = article.get("article_id", "")
+    if not re.fullmatch(r"[A-Za-z0-9]+", article_id):
+        raise RuntimeError("站内长文缺少有效 article_id")
+    url = f"https://articles.zsxq.com/inline_form/id_{article_id}.html"
+    req = urllib.request.Request(url, headers={"Cookie": f"zsxq_access_token={token}",
+                                          "User-Agent": IMAGE_DL_HEADERS["User-Agent"]})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        html = response.read().decode("utf-8")
+    content = ArticleContent()
+    content.feed(html)
+    text = "\n".join(line.strip() for line in "".join(content.parts).splitlines() if line.strip())
+    if not text:
+        raise RuntimeError(f"站内长文 {article_id} 无正文")
+    sections = [f"**站内长文原文**：https://articles.zsxq.com/id_{article_id}.html", text]
+    if content.images:
+        if not VISION_OCR_BIN.exists():
+            raise RuntimeError("站内长文含图片，但 vision_ocr 不可用")
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            for index, image_url in enumerate(content.images, 1):
+                image = Path(tmp) / f"article-{index}.jpg"
+                if not download_image(image_url, image):
+                    raise RuntimeError(f"站内长文 {article_id} 图片 {index} 下载失败")
+                layout = render_ocr_layout(run_vision_ocr(image))
+                if not layout:
+                    raise RuntimeError(f"站内长文 {article_id} 图片 {index} OCR 失败")
+                sections.append(f"**长文图片OCR（图{index}）**：\n\n```\n{layout}\n```")
+    return "\n\n".join(sections)
+
+
 def format_topic(topic: dict, token: str | None = None) -> dict | None:
     """将单个 topic 格式化为输出格式；提供 token 时抓取完整评论"""
     ttype = topic.get("type", "")
@@ -499,6 +565,10 @@ def format_topic(topic: dict, token: str | None = None) -> dict | None:
                 full_text += f"**{answer_owner} 回答：**\n\n{a_text}"
     else:
         full_text = text
+        if talk.get("article"):
+            if token is None:
+                raise RuntimeError("站内长文需要认证 token 才能导出全文")
+            full_text += "\n\n" + fetch_article(talk["article"], token)
 
     # 提取标题；提问帖只基于问题正文，避免把“某某提问”署名当作标题
     title_source = q_text if ttype == "q&a" else full_text
@@ -638,7 +708,7 @@ def main():
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE, help="token 所在的 .env 文件路径")
     parser.add_argument("--start", help="开始日期 YYYY-MM-DD")
     parser.add_argument("--end", help="结束日期 YYYY-MM-DD")
-    parser.add_argument("--days", type=int, default=3, help="最近N天（默认3天）")
+    parser.add_argument("--days", type=int, default=5, help="最近N天（默认5天）")
     parser.add_argument("--no-filter", action="store_true", help="不按能量评分过滤，保留所有帖子")
     parser.add_argument("--min-score", type=float, default=None, help="最低能量评分过滤阈值（默认不过滤）")
     args = parser.parse_args()

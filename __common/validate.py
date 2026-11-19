@@ -35,6 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from __common import stance
+from __common.apply_stances import ARTICLE as STANCE_ARTICLE, TIMELINE, timeline_html
 from __common.filter import kept_ids, load as load_manifest, validate_manifest
 
 TOPIC_HEADING = re.compile(r'^(## ⭐ .*?|### ❓ ⭐ .*?) \| ID `([1-9][0-9]*)`$', re.M)
@@ -87,6 +88,7 @@ def split_raw(raw: str, focus_owners=frozenset()):
                 comment_lines.append(line)
                 if match_focus_owner(line, focus_owners) is not None:
                     focus += 1
+            seg = seg[:idx].rstrip()
         posts.append((m.group(2), m.group(1), seg, comment_lines, focus))
     return posts
 
@@ -116,7 +118,7 @@ def parse_heading(heading: str, default_year: int):
     if len(fields) != 3:
         raise ValueError(f"标题行字段不足：{heading!r}")
     score_part, time_part, title_part = fields
-    title = strip_focus(title_part)[:15]
+    title = strip_focus(title_part)
     score_display = score_part if re.match(r'^[0-9.]+分$', score_part) else '无能量评分'
     tm = TIME_PART.match(time_part)
     if tm:
@@ -263,6 +265,11 @@ def validate(*, raw_path, draft_path, reviewed_path, final_path=None,
 
     raw_by_id = {p.topic_id: p for p in posts}
     for c in cards:
+        title = re.search(r'\bdata-title="([^"]*)"', c.group(0).split('>', 1)[0])
+        post = raw_by_id.get(c.group(1))
+        if post and (title is None or unescape(title.group(1)) != post.title):
+            errors.append(f"帖子 {c.group(1)}：data-title 与 raw 标题不一致")
+    for c in cards:
         post_id, body = c.group(1), c.group(2)
         if body.count('class="summary"') != 1:
             errors.append(f"帖子 {post_id}：卡片必须恰好 1 个 .summary")
@@ -283,10 +290,11 @@ def validate(*, raw_path, draft_path, reviewed_path, final_path=None,
             if normalize_text(unescape(blocks[0])) != normalize_segment(post.segment):
                 errors.append(f"帖子 {post_id}：raw-block 原文与 raw 片段不一致")
 
+    reviewed = None
     try:
         records = stance.load_json(Path(reviewed_path))
         if kept:
-            stance.validate(records, kept)
+            reviewed = stance.validate(records, kept)
         elif records:
             errors.append("kept 帖为空但 reviewed JSON 非空")
     except ValueError as exc:
@@ -301,6 +309,11 @@ def validate(*, raw_path, draft_path, reviewed_path, final_path=None,
             n = len(re.findall(r'class="market-stance"[^>]*data-source="analysis"', c.group(2)))
             if n != 1:
                 errors.append(f"final 帖子 {c.group(1)}：market-stance(data-source=analysis) 出现 {n} 次，应为 1")
+        timelines = TIMELINE.findall(final)
+        if reviewed is not None:
+            expected = timeline_html(list(STANCE_ARTICLE.finditer(draft)), reviewed)
+            if timelines != [expected] or final.find(expected) > final.find('<div class="legend">'):
+                errors.append("final 市场评分时间线与 kept 卡片顺序、标题、时间或 reviewed 分数不一致")
 
     stats = {
         "J": len(posts),

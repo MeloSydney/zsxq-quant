@@ -52,6 +52,14 @@ header.page h1 { margin: 0 0 8px; font-size: 24px; }
 header.page .src { color: var(--muted); font-size: 13px; margin: 4px 0; }
 .legend { margin-top: 12px; padding: 10px 12px; background: var(--summary);
   border: 1px solid var(--line); border-radius: 8px; font-size: 13px; color: var(--muted); }
+.score-timeline { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--panel); }
+.score-timeline h2 { margin: 0 0 8px; font-size: 16px; }
+.score-timeline ol { margin: 0; padding: 0; list-style: none; overflow-x: auto; }
+.score-timeline li { padding: 5px 0; white-space: nowrap; }
+.score-timeline li.new-day { border-top: 1px solid var(--line); margin-top: 7px; padding-top: 12px; }
+.score-timeline strong { color: var(--gold); }
+.score-timeline time { color: var(--muted); white-space: nowrap; }
 article.post-card { border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
   padding: 16px 18px; margin-bottom: 18px; }
 article.post-card h3 { margin: 0 0 4px; font-size: 17px; }
@@ -247,15 +255,15 @@ def render_draft(*, raw_text: str, summaries: dict[str, str], focus_owners,
         style_attr = f' style="background:{bg}"' if bg else ''
         cards.append(
             f'<article class="post-card" data-post-id="{esc(post.topic_id)}" '
-            f'data-category="{esc(cat_id)}"{ts_attr}{style_attr}>\n'
-            f'<h3>{icon} {esc(post.title)}</h3>\n'
+            f'data-category="{esc(cat_id)}" data-title="{esc(post.title)}"{ts_attr}{style_attr}>\n'
+            f'<h3>{icon} {esc(post.title[:15])}</h3>\n'
             f'<p class="meta">发布 {when} · {esc(post.score_display)} · '
             f'Topic ID <code>{esc(post.topic_id)}</code></p>\n'
             f'<div class="summary">{summary_html(summaries[post.topic_id])}</div>\n'
-            f'{render_images(post.topic_id, image_resolver)}'
-            f'{render_comments(post.comment_lines, focus_owners)}\n'
             f'<details class="raw-block"><summary>查看原文</summary>'
             f'<pre>{esc(post.segment)}</pre></details>\n'
+            f'{render_images(post.topic_id, image_resolver)}'
+            f'{render_comments(post.comment_lines, focus_owners)}\n'
             f'</article>'
         )
 

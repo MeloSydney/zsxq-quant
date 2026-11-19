@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -83,22 +84,24 @@ class RenderDuoyuTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.raw_path = self.root / "1113-多鱼朋友圈_raw_2026-11-01_2026-11-02.md"
+        self.intermediate = self.root / "_temp-file"
+        self.intermediate.mkdir()
+        self.raw_path = self.intermediate / "1113-多鱼朋友圈_raw_2026-11-01_2026-11-02.md"
         self.raw_path.write_text(RAW, encoding="utf-8")
-        self.images_dir = self.root / "1113-多鱼朋友圈_raw_2026-11-01_2026-11-02_images"
+        self.images_dir = self.raw_path.with_suffix("").parent / (self.raw_path.stem + "_images")
         self.images_dir.mkdir()
         (self.images_dir / "111-1.jpg").write_bytes(JPEG_BYTES)
-        self.summaries_path = self.root / "summaries.json"
+        self.summaries_path = self.intermediate / "summaries.json"
         self.summaries_path.write_text(
             json.dumps(SUMMARIES, ensure_ascii=False), encoding="utf-8"
         )
-        self.reviewed_path = self.root / "reviewed.json"
+        self.reviewed_path = self.intermediate / "reviewed.json"
         self.reviewed_path.write_text(
             json.dumps(REVIEWED, ensure_ascii=False), encoding="utf-8"
         )
-        self.filter_path = self.root / "filter.json"
+        self.filter_path = self.intermediate / "filter.json"
         filter_mod.save(MANIFEST, self.filter_path)
-        self.draft_path = self.root / "draft.html"
+        self.draft_path = self.intermediate / "draft.html"
         self.final_path = self.root / "final.html"
 
     def tearDown(self):
@@ -120,6 +123,17 @@ class RenderDuoyuTests(unittest.TestCase):
         final = MODULE.apply(draft, MODULE.load_json(self.reviewed_path))
         MODULE.atomic_write(self.final_path, final)
         return draft, final
+
+    def test_cli_uses_relocated_sidecar_and_root_final(self):
+        argv = ["render_duoyu.py", str(self.raw_path), str(self.summaries_path),
+                str(self.reviewed_path), str(self.filter_path), str(self.draft_path),
+                str(self.final_path)]
+        with patch.object(sys, "argv", argv):
+            MODULE.main()
+        encoded = base64.b64encode(JPEG_BYTES).decode("ascii")
+        self.assertIn(f"data:image/jpeg;base64,{encoded}", self.final_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.final_path.parent, self.root)
+        self.assertEqual({entry.name for entry in self.root.iterdir()}, {"_temp-file", "final.html"})
 
     def test_end_to_end_render_apply_validate(self):
         draft, final = self.render()

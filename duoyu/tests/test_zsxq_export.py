@@ -673,9 +673,10 @@ class MainWorkflowTests(unittest.TestCase):
             self.assertEqual(len(set(temp_names)), 2)
             self.assertEqual(mocked_replace.call_count, 2)
 
-            outputs = list(root.glob("*-多鱼朋友圈_raw_2026-11-01_2026-11-02.md"))
+            outputs = list((root / "_temp-file").glob("*-多鱼朋友圈_raw_2026-11-01_2026-11-02.md"))
             self.assertEqual(len(outputs), 1)
-            self.assertFalse(list(root.glob("*.tmp")))
+            self.assertEqual([entry.name for entry in root.iterdir() if entry.name != ".env"], ["_temp-file"])
+            self.assertFalse(list((root / "_temp-file").glob("*.tmp")))
             document = outputs[0].read_text(encoding="utf-8")
             self.assertTrue(document.startswith("# 多鱼朋友圈（原始数据）"))
             self.assertLess(document.index("较新帖子"), document.index("较早帖子"))
@@ -696,7 +697,8 @@ class MainWorkflowTests(unittest.TestCase):
             env_file.write_text("ZSXQ_ACCESS_TOKEN=fake-token\n", encoding="utf-8")
             env_file.chmod(0o600)
             mmdd = MODULE.datetime.now(MODULE.CST).strftime("%m%d")
-            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
+            output_path = root / "_temp-file" / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
+            output_path.parent.mkdir()
             output_path.write_text("existing complete output", encoding="utf-8")
             argv = [
                 "zsxq_export.py",
@@ -718,7 +720,7 @@ class MainWorkflowTests(unittest.TestCase):
                     MODULE.main()
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), "existing complete output")
-            self.assertFalse(list(root.glob("*.tmp")))
+            self.assertFalse(list((root / "_temp-file").glob("*.tmp")))
 
     def test_write_failure_preserves_old_output_and_removes_partial_temp(self):
         source_topics = [topic(1, "2026-11-02T09:00:00+08:00")]
@@ -730,9 +732,10 @@ class MainWorkflowTests(unittest.TestCase):
             env_file.write_text("ZSXQ_ACCESS_TOKEN=fake-token\n", encoding="utf-8")
             env_file.chmod(0o600)
             mmdd = MODULE.datetime.now(MODULE.CST).strftime("%m%d")
-            output_path = root / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
+            output_path = root / "_temp-file" / f"{mmdd}-多鱼朋友圈_raw_2026-11-02_2026-11-02.md"
+            output_path.parent.mkdir()
             output_path.write_text("existing complete output", encoding="utf-8")
-            forced_temp_path = root / "forced-partial.tmp"
+            forced_temp_path = root / "_temp-file" / "forced-partial.tmp"
 
             class FailingTempFile:
                 name = str(forced_temp_path)
@@ -843,7 +846,7 @@ class MainWorkflowTests(unittest.TestCase):
             ), patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
                 MODULE.main()
 
-            document = next(root.glob("*-多鱼朋友圈_raw_2026-11-02_2026-11-02.md")).read_text(
+            document = next((root / "_temp-file").glob("*-多鱼朋友圈_raw_2026-11-02_2026-11-02.md")).read_text(
                 encoding="utf-8"
             )
             self.assertIn("高分星主帖", document)

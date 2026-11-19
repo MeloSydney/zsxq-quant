@@ -18,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from __common.apply_stances import apply, TIMELINE
+from __common.stance import Stance
 from __common.filter import pass_all, validate_manifest
 from __common.render import render_draft
 from __common.validate import validate
@@ -375,6 +377,69 @@ class DuoyuShapeTest(PipelineCase):
         draft = self.render()
         self.assertNotIn("data:image", draft)
         self.assertNotIn('<div class="images">', draft)
+
+
+class TimelineTest(PipelineCase):
+    def test_dgf_order_days_duplicate_titles_and_escaping(self):
+        raw = DGF_RAW.replace('普通标题', '同名 & <X> 长标题超十五字').replace('广告水帖', '同名 & <X> 长标题超十五字')
+        draft = render_draft(
+            raw_text=raw, summaries={i: i for i in DgfShapeTest.ids},
+            focus_owners=DGF_OWNERS, categories=DGF_CATEGORIES, classify=dgf_classify,
+            source_name='测试星球')
+        records = [Stance(i, score, '范围', '未来两个交易日', '依据') for i, score in
+                   [('3001', -2), ('3002', 2), ('3003', 0), ('3004', -1)]]
+        self.assertIn('.score-timeline ol { margin: 0; padding: 0; list-style: none; overflow-x: auto; }', draft)
+        self.assertIn('.score-timeline li { padding: 5px 0; white-space: nowrap; }', draft)
+        final = apply(draft, records)
+        timeline = TIMELINE.search(final).group(0)
+        self.assertLess(final.index(timeline), final.index('市场态度五档图例'))
+        self.assertEqual(re.findall(r'<li[^>]*data-post-id="(\d+)"', timeline),
+                         ['3002', '3003', '3001', '3004'])
+        self.assertEqual(re.findall(r'<strong>(.*?)</strong>', timeline), ['+2', '0', '-2', '-1'])
+        self.assertEqual(timeline.count('class="new-day"'), 2)
+        self.assertEqual(timeline.count('同名 &amp; &lt;X&gt; 长标题超十五字'), 2)
+        self.assertNotIn('<X>', timeline)
+        self.assertIn('2026-11-13 10:00', timeline)
+        with tempfile.TemporaryDirectory() as tmp:
+            (errors, _), *_ = self.run_validate(
+                Path(tmp), raw, draft, [vars(r) for r in records], DgfShapeTest.ids,
+                owners=DGF_OWNERS, categories=DGF_CATEGORIES, final_html=final)
+            self.assertEqual(errors, [])
+            broken = final.replace('<strong>+2</strong>', '<strong>+1</strong>', 1)
+            (errors, _), *_ = self.run_validate(
+                Path(tmp), raw, draft, [vars(r) for r in records], DgfShapeTest.ids,
+                owners=DGF_OWNERS, categories=DGF_CATEGORIES, final_html=broken)
+            self.assertTrue(any('时间线' in error for error in errors))
+
+    def test_equal_timestamps_keep_source_order(self):
+        raw = DGF_RAW.replace('11-12 09:00', '11-13 10:00')
+        draft = render_draft(
+            raw_text=raw, summaries={i: i for i in DgfShapeTest.ids},
+            focus_owners=DGF_OWNERS, categories=DGF_CATEGORIES, classify=dgf_classify,
+            source_name='测试星球')
+        final = apply(draft, [Stance(i, 0, '范围', '未来两个交易日', '依据')
+                              for i in DgfShapeTest.ids])
+        timeline = TIMELINE.search(final).group(0)
+        self.assertEqual(re.findall(r'<li[^>]*data-post-id="(\d+)"', timeline),
+                         ['3001', '3002', '3003', '3004'])
+
+    def test_duoyu_kept_only(self):
+        case = DuoyuShapeTest()
+        draft = case.render()
+        records = [Stance(i, score, '范围', '未来两个交易日', '依据')
+                   for i, score in [('5001', 1), ('5003', 0)]]
+        final = apply(draft, records)
+        timeline = TIMELINE.search(final).group(0)
+        self.assertEqual(re.findall(r'<li[^>]*data-post-id="(\d+)"', timeline), ['5001', '5003'])
+        self.assertEqual(timeline.count('class="new-day"'), 1)
+        self.assertNotIn('5002', timeline)
+        with tempfile.TemporaryDirectory() as tmp:
+            (errors, stats), *_ = self.run_validate(
+                Path(tmp), DUOYU_RAW, draft, [vars(r) for r in records], case.kept,
+                owners=DUOYU_OWNERS, categories=DUOYU_CATEGORIES,
+                manifest=case.manifest(), final_html=final)
+            self.assertEqual(errors, [])
+            self.assertEqual(stats['kept'], 2)
 
 
 if __name__ == "__main__":

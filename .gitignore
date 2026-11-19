@@ -6,3 +6,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# User-specific holdings and fetched trading calendar.
+short-term/hold
+short-term/trade_cal_cache.json
